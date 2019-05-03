@@ -3,108 +3,115 @@ import 'dart:html';
 import 'dart:math' as math;
 
 import 'package:qr/qr.dart';
+import 'package:stream_transform/stream_transform.dart';
 
 import 'src/affine_transform.dart';
 import 'src/bot.dart';
-import 'src/throttled_stream.dart';
 
 void main() {
   final canvas = querySelector('#content') as CanvasElement;
   final typeDiv = querySelector('#type-div') as DivElement;
   final errorDiv = querySelector('#error-div') as DivElement;
   final input = querySelector('#input') as InputElement;
-  final demo = QrDemo(canvas, typeDiv, errorDiv)..value = input.value;
 
-  input.onKeyUp.listen((KeyboardEvent args) {
-    demo.value = input.value;
-  });
+  final inputValues = input.onKeyUp.map((_) => input.value);
 
-  demo.output.listen((data) {
-    input.style.background = '';
-  }, onError: (error) {
-    input.style.background = 'red';
-    print(error);
-  });
+  final typeNumbers = _setupTypeNumber(typeDiv);
+  final errorCorrectLevels = _setupErrorCorrectLevel(errorDiv);
+
+  final grids = typeNumbers
+      .cast<dynamic>()
+      .transform(combineLatestAll([errorCorrectLevels, inputValues]))
+      .transform(startWith([10, QrErrorCorrectLevel.M, input.value]))
+      .transform(asyncMapSample(_calc))
+      .transform(tap((_) {
+        input.style.background = '';
+      }, onError: (error, _) {
+        input.style.background = 'red';
+        print(error);
+      }));
+
+  QrDemo(canvas, grids);
+}
+
+Stream<int> _setupTypeNumber(DivElement typeDiv) {
+  const _typeRadioIdKey = 'type-value';
+  final controller = StreamController<int>.broadcast();
+  void _levelClick(Event args) {
+    final source = args.target as InputElement;
+
+    final typeNumber = int.parse(source.dataset[_typeRadioIdKey]);
+    controller.add(typeNumber);
+  }
+
+  for (var i = 1; i <= 10; i++) {
+    var radio = InputElement(type: 'radio')
+      ..id = 'type_$i'
+      ..name = 'type'
+      ..onChange.listen(_levelClick)
+      ..dataset[_typeRadioIdKey] = i.toString();
+    if (i == 10) {
+      radio.attributes['checked'] = 'checked';
+    }
+    typeDiv.children.add(radio);
+
+    var label = LabelElement()
+      ..innerHtml = '$i'
+      ..htmlFor = radio.id
+      ..classes.add('btn');
+    typeDiv.children.add(label);
+  }
+  return controller.stream;
+}
+
+Stream<int> _setupErrorCorrectLevel(DivElement errorDiv) {
+  const _errorLevelIdKey = 'error-value';
+  final controller = StreamController<int>.broadcast();
+  void _errorClick(Event args) {
+    final source = args.target as InputElement;
+    final errorCorrectLevel = int.parse(source.dataset[_errorLevelIdKey]);
+    controller.add(errorCorrectLevel);
+  }
+
+  for (final v in QrErrorCorrectLevel.levels) {
+    var radio = InputElement(type: 'radio')
+      ..id = 'error_$v'
+      ..name = 'error-level'
+      ..onChange.listen(_errorClick)
+      ..dataset[_errorLevelIdKey] = v.toString();
+    if (v == QrErrorCorrectLevel.M) {
+      radio.attributes['checked'] = 'checked';
+    }
+    errorDiv.children.add(radio);
+
+    var label = LabelElement()
+      ..innerHtml = QrErrorCorrectLevel.getName(v)
+      ..htmlFor = radio.id
+      ..classes.add('btn');
+    errorDiv.children.add(label);
+  }
+  return controller.stream;
 }
 
 class QrDemo {
-  static const String _typeRadioIdKey = 'type-value';
-  static const String _errorLevelIdKey = 'error-value';
   final BungeeNum _scale;
   final CanvasElement _canvas;
-  final ThrottledStream<List<Object>, List<bool>> _qrMapper;
   final CanvasRenderingContext2D _ctx;
-
-  String _value = '';
-  int _typeNumber = 10;
-  int _errorCorrectLevel = QrErrorCorrectLevel.M;
 
   List<bool> _squares;
 
   bool _frameRequested = false;
 
-  QrDemo(CanvasElement canvas, DivElement typeDiv, DivElement errorDiv)
+  QrDemo(CanvasElement canvas, Stream<List<bool>> grids)
       : _canvas = canvas,
         _ctx = canvas.context2D,
-        _qrMapper = ThrottledStream<List<Object>, List<bool>>(_calc),
         _scale = BungeeNum(1) {
     _ctx.fillStyle = 'black';
 
-    _qrMapper.outputStream.listen((args) {
-      _squares = _qrMapper.outputValue;
+    grids.listen((squares) {
+      _squares = squares;
       requestFrame();
     });
-
-    //
-    // Type Div
-    //
-    for (var i = 1; i <= 10; i++) {
-      var radio = InputElement(type: 'radio')
-        ..id = 'type_$i'
-        ..name = 'type'
-        ..onChange.listen(_levelClick)
-        ..dataset[_typeRadioIdKey] = i.toString();
-      if (i == _typeNumber) {
-        radio.attributes['checked'] = 'checked';
-      }
-      typeDiv.children.add(radio);
-
-      var label = LabelElement()
-        ..innerHtml = '$i'
-        ..htmlFor = radio.id
-        ..classes.add('btn');
-      typeDiv.children.add(label);
-    }
-
-    //
-    // Error Correct Levels
-    //
-    for (final v in QrErrorCorrectLevel.levels) {
-      var radio = InputElement(type: 'radio')
-        ..id = 'error_$v'
-        ..name = 'error-level'
-        ..onChange.listen(_errorClick)
-        ..dataset[_errorLevelIdKey] = v.toString();
-      if (v == _errorCorrectLevel) {
-        radio.attributes['checked'] = 'checked';
-      }
-      errorDiv.children.add(radio);
-
-      var label = LabelElement()
-        ..innerHtml = QrErrorCorrectLevel.getName(v)
-        ..htmlFor = radio.id
-        ..classes.add('btn');
-      errorDiv.children.add(label);
-    }
-  }
-
-  Stream get output => _qrMapper.outputStream;
-
-  String get value => _value;
-
-  set value(String input) {
-    _value = input;
-    _update();
   }
 
   void requestFrame() {
@@ -112,24 +119,6 @@ class QrDemo {
       _frameRequested = true;
       window.requestAnimationFrame(_onFrame);
     }
-  }
-
-  void _levelClick(Event args) {
-    final source = args.target as InputElement;
-    _typeNumber = int.parse(source.dataset[_typeRadioIdKey]);
-    _update();
-  }
-
-  void _errorClick(Event args) {
-    final source = args.target as InputElement;
-    _errorCorrectLevel = int.parse(source.dataset[_errorLevelIdKey]);
-    _update();
-  }
-
-  void _update() {
-    final t = [_typeNumber, _errorCorrectLevel, _value];
-
-    _qrMapper.source = t;
   }
 
   void _onFrame(num highResTime) {
@@ -169,7 +158,7 @@ class QrDemo {
   }
 }
 
-List<bool> _calc(List input) {
+Future<List<bool>> _calc(List input) async {
   final code = QrCode(input[0] as int, input[1] as int)
     ..addData(input[2] as String)
     ..make();
